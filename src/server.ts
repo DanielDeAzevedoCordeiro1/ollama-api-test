@@ -3,48 +3,30 @@ import cors from "cors";
 import { createClient } from "redis";
 import { loadEnvFile } from "process";
 import jwt from 'jsonwebtoken'
+import config from "./infra/config/config";
+import { Role, User, UserRequest, UserResponse } from "./domain/User";
+import { GenerateResponseUseCase } from "./application/GenerateResponseUseCase";
+import { RedisRepository } from "./infra/db/repository/RedisRepository";
+import { CheckIfResponseExists } from "./application/CheckIfResponseExistsInCacheUseCase";
+import { OllamaService } from "./infra/ai/api/ollama/ollama";
 
 const app = express();
 loadEnvFile();
 app.use(cors());
 app.use(express.json());
-const PORT = process.env.PORT || 3000;
-const OLLAMA_URL = process.env.OLLAMA_URL;
-const REDIS_URL = process.env.REDIS_URL;
-const MODEL = process.env.MODEL;
-const JWT_SECRET = process.env.JWT_SECRET!;
 
-const client = createClient({
-  url: REDIS_URL!,
+export const client = createClient({
+  url: config.redisUrl,
 });
 
-client.on("error", (err) =>
-  console.error("Erro ao se conectar ao REDIS::: ", err),
+const repository = new RedisRepository();
+const modelApiService = new OllamaService(); 
+const checkResponseExistsUseCase = new CheckIfResponseExists(repository);
+const generateResponse = new GenerateResponseUseCase(
+  repository,
+  checkResponseExistsUseCase,
+  modelApiService,
 );
-
-type Role = 'user' | 'premium';
-
-interface User {
-  id: string,
-  name: string,
-  email: string,
-  password: string,
-  role: Role,
-};
-
-interface UserRequest {
-  name: string,
-  email: string,
-  password: string,
-  role: Role,
-};
-
-interface UserResponse {
-  id: string
-  name: string,
-  email: string,
-  role: Role,
-};
 
 interface JWTPayload {
   id: string,
@@ -103,14 +85,14 @@ const generateJWTToken = (id: string, email: string, role: Role): string => {
     email: email,
     role: role
   } as JWTPayload,
-    JWT_SECRET, {
+    config.jwtSecret, {
     expiresIn: "1h"
   });
 }
 
 const decodeToken = (token: string): JWTPayload | null  => {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as JWTPayload;
+    const decoded = jwt.verify(token, config.jwtSecret) as JWTPayload;
     return {
       id: decoded.id,
       email: decoded.email,
@@ -151,34 +133,11 @@ app.post("/chat", validateBody, authMiddleware, async (req: AuthRequest, res: Re
     return res.status(401).json({ error: "Acesso Negado!, So usuarios premium pode usar esta feature!" });
   }
   
-  const redisVerify = await client.GET(message);
+  const response = await generateResponse.execute(message);
 
-  if (redisVerify !== null) {
-    console.log("Pergunta ja esta em cache");
-    console.log(`Resposta do cache: ${redisVerify}`);
-    return res.status(200).json(redisVerify);
-  }
-  const response = await fetch(OLLAMA_URL!, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: `${MODEL!}`,
-      messages: [
-        {
-          role: "user",
-          content: message,
-        },
-      ],
-      stream: false,
-    }),
-  }).then((res) => res.json());
+  if (!response) return res.status(400).json({ error: "Falhou ao gerar a resposta!" });
 
-  console.log(response)
   const responseContent = response.message.content;
-  console.log("Salvando no REDIS");
-  await client.SET(message, responseContent);
 
   console.log(`Resposta da pergunta:::: ${message} \n${responseContent}`);
   return res.status(200).json(responseContent);
@@ -213,7 +172,7 @@ app.get('/profile', authMiddleware, (req: AuthRequest, res: Response) => {
   return res.status(200).json({ userCredentials: req.user });
 })
 
-app.listen(PORT, async () => {
+app.listen(config.port, async () => {
   await client.connect();
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on port ${config.port}`);
 })
